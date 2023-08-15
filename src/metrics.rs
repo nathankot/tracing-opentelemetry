@@ -1,11 +1,15 @@
 use std::{collections::HashMap, fmt, sync::RwLock};
-use tracing::{field::Visit, Subscriber};
-use tracing_core::{Field, Interest, Metadata};
 
 use opentelemetry::{
-    metrics::{Counter, Histogram, Meter, MeterProvider, UpDownCounter},
+    metrics::{
+        Counter, Histogram, Meter, MeterProvider, ObservableGauge,
+        UpDownCounter,
+    },
     KeyValue, Value,
 };
+use smallvec::SmallVec;
+use tracing::{field::Visit, Subscriber};
+use tracing_core::{Field, Interest, Metadata};
 use tracing_subscriber::{
     filter::Filtered,
     layer::{Context, Filter},
@@ -13,20 +17,21 @@ use tracing_subscriber::{
     Layer,
 };
 
-use smallvec::SmallVec;
-
 const CARGO_PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 const INSTRUMENTATION_LIBRARY_NAME: &str = "tracing/tracing-opentelemetry";
 
 const METRIC_PREFIX_MONOTONIC_COUNTER: &str = "monotonic_counter.";
 const METRIC_PREFIX_COUNTER: &str = "counter.";
 const METRIC_PREFIX_HISTOGRAM: &str = "histogram.";
+const METRIC_PREFIX_GAUGE: &str = "gauge.";
 const I64_MAX: u64 = i64::MAX as u64;
 
 #[derive(Default)]
 pub(crate) struct Instruments {
     u64_counter: MetricsMap<Counter<u64>>,
     f64_counter: MetricsMap<Counter<f64>>,
+    i64_gauge: MetricsMap<ObservableGauge<i64>>,
+    f64_gauge: MetricsMap<ObservableGauge<f64>>,
     i64_up_down_counter: MetricsMap<UpDownCounter<i64>>,
     f64_up_down_counter: MetricsMap<UpDownCounter<f64>>,
     u64_histogram: MetricsMap<Histogram<u64>>,
@@ -45,6 +50,8 @@ pub(crate) enum InstrumentType {
     HistogramU64(u64),
     HistogramI64(i64),
     HistogramF64(f64),
+    GaugeI64(i64),
+    GaugeF64(f64),
 }
 
 impl Instruments {
@@ -69,16 +76,28 @@ impl Instruments {
                 }
             }
 
-            // that metric did not already exist, so we have to acquire a write lock to
-            // create it.
+            // that metric did not already exist, so we have to acquire a write
+            // lock to create it.
             let mut lock = map.write().unwrap();
-            // handle the case where the entry was created while we were waiting to
-            // acquire the write lock
+            // handle the case where the entry was created while we were waiting
+            // to acquire the write lock
             let metric = lock.entry(name).or_insert_with(insert);
             update(metric)
         }
 
         match instrument_type {
+            InstrumentType::GaugeI64(value) => update_or_insert(
+                &self.i64_gauge,
+                metric_name,
+                || meter.i64_observable_gauge(metric_name).init(),
+                |ctr| ctr.observe(value, attributes),
+            ),
+            InstrumentType::GaugeF64(value) => update_or_insert(
+                &self.f64_gauge,
+                metric_name,
+                || meter.f64_observable_gauge(metric_name).init(),
+                |ctr| ctr.observe(value, attributes),
+            ),
             InstrumentType::CounterU64(value) => {
                 update_or_insert(
                     &self.u64_counter,
@@ -150,24 +169,48 @@ impl<'a> Visit for MetricVisitor<'a> {
     }
 
     fn record_u64(&mut self, field: &Field, value: u64) {
-        if let Some(metric_name) = field.name().strip_prefix(METRIC_PREFIX_MONOTONIC_COUNTER) {
+        if let Some(metric_name) =
+            field.name().strip_prefix(METRIC_PREFIX_MONOTONIC_COUNTER)
+        {
             self.visited_metrics
                 .push((metric_name, InstrumentType::CounterU64(value)));
-        } else if let Some(metric_name) = field.name().strip_prefix(METRIC_PREFIX_COUNTER) {
+        } else if let Some(metric_name) =
+            field.name().strip_prefix(METRIC_PREFIX_COUNTER)
+        {
             if value <= I64_MAX {
-                self.visited_metrics
-                    .push((metric_name, InstrumentType::UpDownCounterI64(value as i64)));
+                self.visited_metrics.push((
+                    metric_name,
+                    InstrumentType::UpDownCounterI64(value as i64),
+                ));
             } else {
                 eprintln!(
                     "[tracing-opentelemetry]: Received Counter metric, but \
-                    provided u64: {} is greater than i64::MAX. Ignoring \
-                    this metric.",
+                     provided u64: {} is greater than i64::MAX. Ignoring this \
+                     metric.",
                     value
                 );
             }
-        } else if let Some(metric_name) = field.name().strip_prefix(METRIC_PREFIX_HISTOGRAM) {
+        } else if let Some(metric_name) =
+            field.name().strip_prefix(METRIC_PREFIX_HISTOGRAM)
+        {
             self.visited_metrics
                 .push((metric_name, InstrumentType::HistogramU64(value)));
+        } else if let Some(metric_name) =
+            field.name().strip_prefix(METRIC_PREFIX_GAUGE)
+        {
+            if value <= I64_MAX {
+                self.visited_metrics.push((
+                    metric_name,
+                    InstrumentType::GaugeI64(value as i64),
+                ));
+            } else {
+                eprintln!(
+                    "[tracing-opentelemetry]: Received Gauge metric, but \
+                     provided u64: {} is greater than i64::MAX. Ignoring this \
+                     metric.",
+                    value
+                );
+            }
         } else if value <= I64_MAX {
             self.attributes
                 .push(KeyValue::new(field.name(), Value::I64(value as i64)));
@@ -175,15 +218,26 @@ impl<'a> Visit for MetricVisitor<'a> {
     }
 
     fn record_f64(&mut self, field: &Field, value: f64) {
-        if let Some(metric_name) = field.name().strip_prefix(METRIC_PREFIX_MONOTONIC_COUNTER) {
+        if let Some(metric_name) =
+            field.name().strip_prefix(METRIC_PREFIX_MONOTONIC_COUNTER)
+        {
             self.visited_metrics
                 .push((metric_name, InstrumentType::CounterF64(value)));
-        } else if let Some(metric_name) = field.name().strip_prefix(METRIC_PREFIX_COUNTER) {
+        } else if let Some(metric_name) =
+            field.name().strip_prefix(METRIC_PREFIX_COUNTER)
+        {
             self.visited_metrics
                 .push((metric_name, InstrumentType::UpDownCounterF64(value)));
-        } else if let Some(metric_name) = field.name().strip_prefix(METRIC_PREFIX_HISTOGRAM) {
+        } else if let Some(metric_name) =
+            field.name().strip_prefix(METRIC_PREFIX_HISTOGRAM)
+        {
             self.visited_metrics
                 .push((metric_name, InstrumentType::HistogramF64(value)));
+        } else if let Some(metric_name) =
+            field.name().strip_prefix(METRIC_PREFIX_GAUGE)
+        {
+            self.visited_metrics
+                .push((metric_name, InstrumentType::GaugeF64(value)))
         } else {
             self.attributes
                 .push(KeyValue::new(field.name(), Value::F64(value)));
@@ -191,23 +245,33 @@ impl<'a> Visit for MetricVisitor<'a> {
     }
 
     fn record_i64(&mut self, field: &Field, value: i64) {
-        if let Some(metric_name) = field.name().strip_prefix(METRIC_PREFIX_MONOTONIC_COUNTER) {
+        if let Some(metric_name) =
+            field.name().strip_prefix(METRIC_PREFIX_MONOTONIC_COUNTER)
+        {
             self.visited_metrics
                 .push((metric_name, InstrumentType::CounterU64(value as u64)));
-        } else if let Some(metric_name) = field.name().strip_prefix(METRIC_PREFIX_COUNTER) {
+        } else if let Some(metric_name) =
+            field.name().strip_prefix(METRIC_PREFIX_COUNTER)
+        {
             self.visited_metrics
                 .push((metric_name, InstrumentType::UpDownCounterI64(value)));
-        } else if let Some(metric_name) = field.name().strip_prefix(METRIC_PREFIX_HISTOGRAM) {
+        } else if let Some(metric_name) =
+            field.name().strip_prefix(METRIC_PREFIX_HISTOGRAM)
+        {
             self.visited_metrics
                 .push((metric_name, InstrumentType::HistogramI64(value)));
+        } else if let Some(metric_name) =
+            field.name().strip_prefix(METRIC_PREFIX_GAUGE)
+        {
+            self.visited_metrics
+                .push((metric_name, InstrumentType::GaugeI64(value)))
         } else {
             self.attributes.push(KeyValue::new(field.name(), value));
         }
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
-        self.attributes
-            .push(KeyValue::new(field.name(), value.to_owned()));
+        self.attributes.push(KeyValue::new(field.name(), value.to_owned()));
     }
 
     fn record_bool(&mut self, field: &Field, value: bool) {
@@ -247,7 +311,8 @@ impl<'a> Visit for MetricVisitor<'a> {
 /// - `monotonic_counter.` (non-negative numbers): Used when the counter should
 ///   only ever increase
 /// - `counter.`: Used when the counter can go up or down
-/// - `histogram.`: Used to report arbitrary values that are likely to be statistically meaningful
+/// - `histogram.`: Used to report arbitrary values that are likely to be
+///   statistically meaningful
 ///
 /// Examples:
 /// ```
@@ -308,7 +373,8 @@ impl<'a> Visit for MetricVisitor<'a> {
 ///
 /// # Attributes
 ///
-/// When `MetricsLayer` outputs metrics, it converts key-value pairs into [Attributes] and associates them with metrics.
+/// When `MetricsLayer` outputs metrics, it converts key-value pairs into
+/// [Attributes] and associates them with metrics.
 ///
 /// [Attributes]: https://opentelemetry.io/docs/specs/otel/common/#attribute
 ///
@@ -317,7 +383,7 @@ impl<'a> Visit for MetricVisitor<'a> {
 /// # use tracing::info;
 /// // adds attributes bar="baz" and qux=2 to the `foo` counter.
 /// info!(monotonic_counter.foo = 1, bar = "baz", qux = 2);
-/// ```      
+/// ```
 ///
 /// # Implementation Details
 ///
@@ -330,7 +396,6 @@ impl<'a> Visit for MetricVisitor<'a> {
 ///
 /// In the future, this can be improved by associating each `Metric` instance to
 /// its callsite, eliminating the need for any maps.
-///
 #[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
 pub struct MetricsLayer<S> {
     inner: Filtered<InstrumentLayer, MetricsFilter, S>,
@@ -373,6 +438,7 @@ impl MetricsFilter {
                 name.starts_with(METRIC_PREFIX_COUNTER)
                     || name.starts_with(METRIC_PREFIX_MONOTONIC_COUNTER)
                     || name.starts_with(METRIC_PREFIX_HISTOGRAM)
+                    || name.starts_with(METRIC_PREFIX_GAUGE)
             })
     }
 }
@@ -410,16 +476,14 @@ where
         event.record(&mut metric_visitor);
 
         // associate attrivutes with visited metrics
-        visited_metrics
-            .into_iter()
-            .for_each(|(metric_name, value)| {
-                self.instruments.update_metric(
-                    &self.meter,
-                    value,
-                    metric_name,
-                    attributes.as_slice(),
-                );
-            })
+        visited_metrics.into_iter().for_each(|(metric_name, value)| {
+            self.instruments.update_metric(
+                &self.meter,
+                value,
+                metric_name,
+                attributes.as_slice(),
+            );
+        })
     }
 }
 
@@ -431,7 +495,10 @@ where
         self.inner.on_layer(subscriber)
     }
 
-    fn register_callsite(&self, metadata: &'static Metadata<'static>) -> Interest {
+    fn register_callsite(
+        &self,
+        metadata: &'static Metadata<'static>,
+    ) -> Interest {
         self.inner.register_callsite(metadata)
     }
 
@@ -498,15 +565,20 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tracing_subscriber::layer::SubscriberExt;
+
+    use super::*;
 
     struct PanicLayer;
     impl<S> Layer<S> for PanicLayer
     where
         S: Subscriber + for<'span> LookupSpan<'span>,
     {
-        fn on_event(&self, _event: &tracing_core::Event<'_>, _ctx: Context<'_, S>) {
+        fn on_event(
+            &self,
+            _event: &tracing_core::Event<'_>,
+            _ctx: Context<'_, S>,
+        ) {
             panic!("panic");
         }
     }
